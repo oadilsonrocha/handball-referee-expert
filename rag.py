@@ -16,7 +16,7 @@ EMB_PATH = _DATA / "embeddings.npy"
 
 EMBED_MODEL = "gemini-embedding-001"
 EMBED_DIM = 768
-BATCH = 50
+BATCH = 20
 
 
 def load_chunks():
@@ -28,15 +28,15 @@ def _normalize(m: np.ndarray) -> np.ndarray:
     return m / np.clip(norms, 1e-12, None)
 
 
-def _embed(client: genai.Client, texts, task_type: str, retries: int = 6):
+def _embed(client: genai.Client, texts, task_type: str, retries: int = 10):
     cfg = types.EmbedContentConfig(task_type=task_type, output_dimensionality=EMBED_DIM)
     for attempt in range(retries):
         try:
             res = client.models.embed_content(model=EMBED_MODEL, contents=texts, config=cfg)
             return np.array([e.values for e in res.embeddings], dtype=np.float32)
         except errors.APIError as e:
-            if e.code == 429 and attempt < retries - 1:
-                time.sleep(20 * (attempt + 1))  # limite por minuto: espera e tenta de novo
+            if e.code in (429, 500, 503) and attempt < retries - 1:
+                time.sleep(min(15 * (attempt + 1), 60))  # limite por minuto ou instabilidade
                 continue
             raise
 

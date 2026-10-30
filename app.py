@@ -92,6 +92,15 @@ def sources_md(hits):
 
 # ---------------- Interface ----------------
 st.title("🤾 Handball Referee Expert")
+AUTOR_NOME = st.secrets.get("AUTOR_NOME", "")
+AUTOR_LINK = st.secrets.get("AUTOR_LINK", "")
+if AUTOR_NOME:
+    if AUTOR_LINK:
+        if not AUTOR_LINK.startswith("http"):
+            AUTOR_LINK = "https://" + AUTOR_LINK
+        st.markdown(f"Desenvolvido por [{AUTOR_NOME}]({AUTOR_LINK})")
+    else:
+        st.markdown(f"Desenvolvido por {AUTOR_NOME}")
 st.caption("Tire dúvidas sobre as regras oficiais da IHF. As respostas vêm dos documentos oficiais, "
            "com indicação da fonte.")
 
@@ -178,4 +187,6 @@ if question:
                 st.warning("Muitas perguntas ao mesmo tempo. Aguarde um minuto e tente de novo.")
             else:
                 st.error("Não consegui responder agora. Tente novamente em instantes.")
+                with st.expander("Detalhes técnicos"):
+                    st.code(f"Código {e.code}: {e.message}"[:800])
                 print("Erro na API Gemini:", e)
