@@ -1,4 +1,2 @@
 streamlit>=1.40
-google-genai>=1.20
-numpy
-pypdf
+groq>=0.30

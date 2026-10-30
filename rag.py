@@ -1,87 +1,67 @@
-"""Busca dos trechos relevantes (RAG) usando embeddings do Gemini."""
+"""Busca dos trechos relevantes (RAG) por palavras-chave (BM25), sem serviços externos."""
 import json
+import math
 import re
-import time
+from collections import Counter
 from pathlib import Path
 
-import numpy as np
-from google import genai
-from google.genai import errors, types
-
 ROOT = Path(__file__).resolve().parent
-# Aceita os arquivos dentro de data/ ou soltos na raiz (versão simplificada para celular).
 _DATA = ROOT / "data" if (ROOT / "data" / "chunks.json").exists() else ROOT
 CHUNKS_PATH = _DATA / "chunks.json"
-EMB_PATH = _DATA / "embeddings.npy"
 
-EMBED_MODEL = "gemini-embedding-001"
-EMBED_DIM = 768
-BATCH = 20
+STOP = set("""a an the and or of to in on at by for with from as is are be been being was were it its
+this that these those which who whom what when where how why if then than so not no can may must shall
+should will would do does did has have had there their they them he she his her i you we our your
+any all each other such only also into out up down over under more most very""".split())
 
-
-def load_chunks():
-    return json.loads(CHUNKS_PATH.read_text(encoding="utf-8"))
+TOKEN = re.compile(r"\d{1,2}:\d{1,2}[a-z]?|[a-zà-ú0-9]+")
 
 
-def _normalize(m: np.ndarray) -> np.ndarray:
-    norms = np.linalg.norm(m, axis=1, keepdims=True)
-    return m / np.clip(norms, 1e-12, None)
+def _stem(w: str) -> str:
+    for suf in ("ing", "ed", "es", "s"):
+        if len(w) > 4 and w.endswith(suf):
+            return w[: -len(suf)]
+    return w
 
 
-def _embed(client: genai.Client, texts, task_type: str, retries: int = 10):
-    cfg = types.EmbedContentConfig(task_type=task_type, output_dimensionality=EMBED_DIM)
-    for attempt in range(retries):
-        try:
-            res = client.models.embed_content(model=EMBED_MODEL, contents=texts, config=cfg)
-            return np.array([e.values for e in res.embeddings], dtype=np.float32)
-        except errors.APIError as e:
-            if e.code in (429, 500, 503) and attempt < retries - 1:
-                time.sleep(min(15 * (attempt + 1), 60))  # limite por minuto ou instabilidade
+def tokenize(text: str):
+    return [_stem(t) for t in TOKEN.findall(text.lower()) if t not in STOP and len(t) > 1]
+
+
+class Index:
+    def __init__(self, chunks, k1=1.5, b=0.75):
+        self.chunks = chunks
+        self.k1, self.b = k1, b
+        self.docs = [Counter(tokenize(f"{c['title']} {c['text']}")) for c in chunks]
+        self.lens = [sum(d.values()) for d in self.docs]
+        self.avg = sum(self.lens) / len(self.lens)
+        df = Counter()
+        for d in self.docs:
+            df.update(d.keys())
+        n = len(self.docs)
+        self.idf = {t: math.log(1 + (n - f + 0.5) / (f + 0.5)) for t, f in df.items()}
+
+    def search(self, query: str, k=5, modalities=None):
+        q = Counter(tokenize(query))
+        refs = set(re.findall(r"\b\d{1,2}:\d{1,2}[a-z]?\b", query))
+        scored = []
+        for i, d in enumerate(self.docs):
+            c = self.chunks[i]
+            if modalities and c["modality"] not in modalities:
                 continue
-            raise
+            s = 0.0
+            norm = self.k1 * (1 - self.b + self.b * self.lens[i] / self.avg)
+            for t, qf in q.items():
+                f = d.get(t)
+                if f:
+                    s += self.idf[t] * f * (self.k1 + 1) / (f + norm)
+            if refs and any(r in c["text"] for r in refs):
+                s += 3.0
+            if s > 0:
+                scored.append((s, i))
+        scored.sort(reverse=True)
+        return [self.chunks[i] for _, i in scored[:k]]
 
 
-def build_embeddings(client: genai.Client, chunks, progress=None) -> np.ndarray:
-    """Gera os embeddings de todos os trechos (uma vez só) e salva em disco."""
-    parts = []
-    for i in range(0, len(chunks), BATCH):
-        batch = chunks[i:i + BATCH]
-        texts = [f"{c['title']}\n{c['text']}" for c in batch]
-        parts.append(_embed(client, texts, "RETRIEVAL_DOCUMENT"))
-        if progress:
-            progress(min(i + BATCH, len(chunks)) / len(chunks))
-    emb = _normalize(np.vstack(parts))
-    EMB_PATH.parent.mkdir(exist_ok=True)
-    np.save(EMB_PATH, emb)
-    return emb
-
-
-def load_embeddings(n_chunks: int):
-    if EMB_PATH.exists():
-        emb = np.load(EMB_PATH)
-        if emb.shape[0] == n_chunks:
-            return emb
-    return None
-
-
-RULE_REF = re.compile(r"\b(\d{1,2}:\d{1,2}[a-z]?)\b")
-
-
-def search(client, question, chunks, emb, k=6, modalities=None):
-    """Retorna os k trechos mais parecidos com a pergunta."""
-    q = _normalize(_embed(client, [question], "RETRIEVAL_QUERY"))[0]
-    scores = emb @ q
-
-    # Pequeno reforço quando a pergunta cita uma regra pelo número (ex.: "8:5").
-    refs = RULE_REF.findall(question)
-    if refs:
-        for i, c in enumerate(chunks):
-            if any(r in c["text"] for r in refs):
-                scores[i] += 0.05
-
-    if modalities:
-        mask = np.array([c["modality"] in modalities for c in chunks])
-        scores = np.where(mask, scores, -1.0)
-
-    top = np.argsort(-scores)[:k]
-    return [chunks[i] for i in top if scores[i] > 0]
+def load_index():
+    return Index(json.loads(CHUNKS_PATH.read_text(encoding="utf-8")))

@@ -1,26 +1,30 @@
-"""Handball Referee Expert – responde com base nos PDFs oficiais da IHF."""
+"""Handball Referee Expert – responde com base nos PDFs oficiais da IHF (versão Groq, gratuita)."""
 import datetime as dt
 import threading
 
+import groq
 import streamlit as st
-from google import genai
-from google.genai import errors, types
 
 import rag
 
 # ---------------- Configurações (podem ser alteradas nos Secrets) ----------------
-CHAT_MODEL = st.secrets.get("GEMINI_MODEL", "gemini-flash-latest")
+# Modelos tentados em ordem: se um atingir o limite gratuito, o app passa para o próximo.
+MODELOS = [m.strip() for m in st.secrets.get(
+    "MODELOS", "openai/gpt-oss-120b,llama-3.3-70b-versatile,llama-3.1-8b-instant").split(",")]
+MODELO_BUSCA = st.secrets.get("MODELO_BUSCA", "llama-3.1-8b-instant")
 MAX_PER_SESSION = int(st.secrets.get("MAX_PERGUNTAS_POR_USUARIO", 20))
-MAX_PER_DAY = int(st.secrets.get("MAX_PERGUNTAS_POR_DIA", 400))
+MAX_PER_DAY = int(st.secrets.get("MAX_PERGUNTAS_POR_DIA", 200))
+AUTOR_NOME = st.secrets.get("AUTOR_NOME", "Dr. Adilson Rocha Ferreira (Maceió, Alagoas, Brasil)")
+AUTOR_LINK = st.secrets.get("AUTOR_LINK", "https://oadilsonrocha.netlify.app/")
 TOP_K = 6
 
 SYSTEM_PROMPT = """Você é o Handball Referee Expert, um assistente especialista nas regras oficiais de handebol da IHF.
 Responda SOMENTE com base nos trechos de documentos fornecidos em cada pergunta.
 
 Regras de resposta:
-- Responda no idioma da pergunta (normalmente português do Brasil), de forma clara e direta.
-- Os documentos estão em inglês: traduza com fidelidade e mantenha termos técnicos consagrados
-  (ex.: tiro de 7 metros, tempo técnico, exclusão de 2 minutos).
+- Responda em português do Brasil (ou no idioma da pergunta), de forma clara e direta.
+- Os documentos estão em inglês: traduza com fidelidade e use os termos técnicos consagrados
+  (tiro de 7 metros, tiro livre, tempo técnico, exclusão de 2 minutos, desqualificação, área de gol).
 - Cite o número da regra quando ele aparecer no trecho (ex.: Regra 8:5) e indique as fontes
   no formato [n], usando a numeração dos trechos.
 - Se as regras forem diferentes entre modalidades (quadra, praia, cadeira de rodas), deixe isso claro.
@@ -29,29 +33,32 @@ Regras de resposta:
   nos documentos. Nunca invente regras.
 - Recuse educadamente perguntas sem relação com handebol."""
 
+REWRITE_PROMPT = """You convert handball rules questions (usually in Portuguese) into English search keywords
+for the official IHF rulebooks. Use official IHF terminology, for example:
+exclusão/2 minutos -> 2-minute suspension; desqualificação -> disqualification; cartão vermelho -> red card disqualification;
+tiro de 7 metros -> 7-metre throw; tiro livre -> free throw; tiro de saída -> throw-off; tiro de meta -> goalkeeper throw;
+tiro lateral -> throw-in; tempo técnico/pedido de tempo -> team time-out; passos/andar -> steps taking more than three steps;
+dois dribles -> double dribble bouncing; jogo passivo -> passive play forewarning signal; área de gol -> goal area;
+goleiro -> goalkeeper; substituição -> substitution zone; bola -> ball size circumference weight; árbitro -> referees;
+gol de giro -> spin shot; gol de dois pontos -> two points; especialista -> specialist; cadeira de rodas -> wheelchair.
+Answer ONLY with one line of 6 to 20 English keywords, no explanations."""
+
 st.set_page_config(page_title="Handball Referee Expert", page_icon="🤾", layout="centered")
 
 
 # ---------------- Recursos compartilhados ----------------
 @st.cache_resource
 def get_client():
-    key = st.secrets.get("GEMINI_API_KEY")
+    key = st.secrets.get("GROQ_API_KEY")
     if not key:
-        st.error("Configure a chave GEMINI_API_KEY nos Secrets do app.")
+        st.error("Configure a chave GROQ_API_KEY nos Secrets do app.")
         st.stop()
-    return genai.Client(api_key=key)
+    return groq.Groq(api_key=key, max_retries=1)
 
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource
 def get_index():
-    chunks = rag.load_chunks()
-    emb = rag.load_embeddings(len(chunks))
-    if emb is None:
-        bar = st.progress(0.0, text="Preparando o índice dos documentos (só na primeira vez)...")
-        emb = rag.build_embeddings(get_client(), chunks,
-                                   progress=lambda p: bar.progress(p, text="Indexando documentos..."))
-        bar.empty()
-    return chunks, emb
+    return rag.load_index()
 
 
 @st.cache_resource
@@ -72,33 +79,64 @@ def take_daily_slot() -> bool:
         return True
 
 
-def build_prompt(question, hits, history):
+def english_query(client, question, prev_q):
+    """Traduz a pergunta para palavras-chave em inglês (os documentos estão em inglês)."""
+    text = f"Previous question: {prev_q}\nQuestion: {question}" if prev_q else question
+    try:
+        r = client.chat.completions.create(
+            model=MODELO_BUSCA, temperature=0, max_completion_tokens=80,
+            messages=[{"role": "system", "content": REWRITE_PROMPT},
+                      {"role": "user", "content": text}])
+        return (r.choices[0].message.content or "").strip()
+    except groq.APIError as e:
+        print("Falha ao traduzir a busca:", e)
+        return ""
+
+
+def build_messages(question, hits, history):
     ctx = "\n\n".join(
         f"[{i}] {h['title']} — página {h['page']}\n{h['text']}" for i, h in enumerate(hits, 1)
-    )
-    hist = ""
-    if history:
-        hist = "Conversa anterior (para contexto):\n" + "\n".join(
-            f"{'Usuário' if m['role'] == 'user' else 'Assistente'}: {m['content'][:600]}"
-            for m in history
-        ) + "\n\n"
-    return f"{hist}Trechos dos documentos:\n\n{ctx}\n\nPergunta: {question}"
+    ) or "(nenhum trecho encontrado)"
+    msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
+    for m in history:
+        msgs.append({"role": m["role"], "content": m["content"][:600]})
+    msgs.append({"role": "user",
+                 "content": f"Trechos dos documentos:\n\n{ctx}\n\nPergunta: {question}"})
+    return msgs
+
+
+def open_stream(client, messages):
+    """Tenta cada modelo da lista até um responder."""
+    last = None
+    for model in MODELOS:
+        extra = {"reasoning_effort": "low"} if model.startswith("openai/gpt-oss") else {}
+        try:
+            return client.chat.completions.create(
+                model=model, messages=messages, temperature=0.2,
+                max_completion_tokens=1200, stream=True, **extra)
+        except (groq.RateLimitError, groq.NotFoundError, groq.InternalServerError,
+                groq.BadRequestError) as e:
+            print(f"Modelo {model} indisponível: {e}")
+            last = e
+    raise last
+
+
+def stream_text(stream):
+    for ch in stream:
+        if ch.choices and ch.choices[0].delta.content:
+            yield ch.choices[0].delta.content
 
 
 def sources_md(hits):
-    lines = [f"**[{i}]** {h['title']} — pág. {h['page']}" for i, h in enumerate(hits, 1)]
-    return "\n\n".join(lines)
+    return "\n\n".join(f"**[{i}]** {h['title']} — pág. {h['page']}" for i, h in enumerate(hits, 1))
 
 
 # ---------------- Interface ----------------
 st.title("🤾 Handball Referee Expert")
-AUTOR_NOME = st.secrets.get("AUTOR_NOME", "")
-AUTOR_LINK = st.secrets.get("AUTOR_LINK", "")
 if AUTOR_NOME:
     if AUTOR_LINK:
-        if not AUTOR_LINK.startswith("http"):
-            AUTOR_LINK = "https://" + AUTOR_LINK
-        st.markdown(f"Desenvolvido por [{AUTOR_NOME}]({AUTOR_LINK})")
+        link = AUTOR_LINK if AUTOR_LINK.startswith("http") else "https://" + AUTOR_LINK
+        st.markdown(f"Desenvolvido por [{AUTOR_NOME}]({link})")
     else:
         st.markdown(f"Desenvolvido por {AUTOR_NOME}")
 st.caption("Tire dúvidas sobre as regras oficiais da IHF. As respostas vêm dos documentos oficiais, "
@@ -147,46 +185,36 @@ if question:
 
     with st.chat_message("assistant"):
         if st.session_state.asked >= MAX_PER_SESSION:
-            msg = (f"Você atingiu o limite de {MAX_PER_SESSION} perguntas nesta sessão. "
-                   "Volte mais tarde. 🙂")
-            st.warning(msg)
+            st.warning(f"Você atingiu o limite de {MAX_PER_SESSION} perguntas nesta sessão. "
+                       "Volte mais tarde. 🙂")
             st.stop()
         if not take_daily_slot():
             st.warning("O chatbot atingiu o limite de perguntas de hoje. Tente novamente amanhã.")
             st.stop()
 
-        st.session_state.messages.append({"role": "user", "content": question})
-        st.session_state.asked += 1
-        history = st.session_state.messages[-5:-1]
-
+        history = st.session_state.messages[-4:]
         try:
             client = get_client()
-            chunks, emb = get_index()
+            index = get_index()
             prev_q = next((m["content"] for m in reversed(history) if m["role"] == "user"), "")
-            search_q = f"{prev_q}\n{question}" if prev_q and len(question) < 80 else question
-            modalities = None if mod == "Todas" else {mod, "Geral"}
             with st.spinner("Consultando as regras..."):
-                hits = rag.search(client, search_q, chunks, emb, k=TOP_K, modalities=modalities)
-
-            stream = client.models.generate_content_stream(
-                model=CHAT_MODEL,
-                contents=build_prompt(question, hits, history),
-                config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT,
-                                                   temperature=0.2),
-            )
-            answer = st.write_stream(ch.text for ch in stream if ch.text)
+                eng = english_query(client, question, prev_q)
+                modalities = None if mod == "Todas" else {mod, "Geral"}
+                hits = index.search(f"{eng} {eng} {question}", k=TOP_K, modalities=modalities)
+                stream = open_stream(client, build_messages(question, hits, history))
+            answer = st.write_stream(stream_text(stream))
             src = sources_md(hits)
-            with st.expander("Fontes"):
-                st.markdown(src)
-            st.session_state.messages.append(
-                {"role": "assistant", "content": answer, "sources": src})
-        except errors.APIError as e:
-            st.session_state.messages.pop()
-            st.session_state.asked -= 1
-            if e.code == 429:
-                st.warning("Muitas perguntas ao mesmo tempo. Aguarde um minuto e tente de novo.")
-            else:
-                st.error("Não consegui responder agora. Tente novamente em instantes.")
-                with st.expander("Detalhes técnicos"):
-                    st.code(f"Código {e.code}: {e.message}"[:800])
-                print("Erro na API Gemini:", e)
+            if src:
+                with st.expander("Fontes"):
+                    st.markdown(src)
+            st.session_state.messages += [
+                {"role": "user", "content": question},
+                {"role": "assistant", "content": answer, "sources": src}]
+            st.session_state.asked += 1
+        except groq.RateLimitError:
+            st.warning("Muitas perguntas ao mesmo tempo. Aguarde um minuto e tente de novo.")
+        except groq.APIError as e:
+            st.error("Não consegui responder agora. Tente novamente em instantes.")
+            with st.expander("Detalhes técnicos"):
+                st.code(f"{type(e).__name__}: {getattr(e, 'message', e)}"[:800])
+            print("Erro na API Groq:", e)
